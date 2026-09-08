@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 from io import BytesIO
 from typing import Optional
-from urllib.parse import quote
 
 import aiohttp
 from telegram import (
@@ -464,90 +462,56 @@ async def menu_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await gate(update, context):
         return ConversationHandler.END
     await update.message.reply_text(
-        "🎧 <b>CALL RECORD</b>\n\nযেকোনো UID পাঠান (পুরনো হলেও চলবে)।\n"
-        "ডাটাবেসে থাকতে হবে না — সরাসরি API থেকে ভয়েস আসবে।\n\n"
-        "যেমন: <code>0c1ee0f22f7fb4b4@jokesphone</code>\n\n❌ /cancel",
+        "🎧 <b>CALL RECORD</b>\n\nকল পাঠানোর পর যে UID পেয়েছেন সেটা পাঠান।\n"
+        "যেমন: <code>97d91c87981bdc4b@jokesphone</code>\n\n❌ /cancel",
         parse_mode=ParseMode.HTML,
         reply_markup=main_kb(),
     )
     return WAIT_UID
 
 
-def walk_urls(obj, found=None):
-    if found is None:
-        found = []
-    if isinstance(obj, dict):
-        for v in obj.values():
-            walk_urls(v, found)
-    elif isinstance(obj, list):
-        for v in obj:
-            walk_urls(v, found)
-    elif isinstance(obj, str):
-        if obj.startswith("http") or obj.startswith("//"):
-            found.append(obj if obj.startswith("http") else "https:" + obj)
-        if obj.startswith("data:audio"):
-            found.append(obj)
-    return found
-
-
 def pick_audio_url(obj) -> Optional[str]:
-    urls = walk_urls(obj)
-    prefer = [u for u in urls if re.search(r"\.(mp3|ogg|wav|m4a|aac|opus)(\?|$)", u, re.I)]
-    if prefer:
-        return prefer[0]
-    media = [u for u in urls if any(x in u.lower() for x in ("audio", "record", "media", "voice", "jokesphone", "mp3"))]
-    if media:
-        return media[0]
-    return urls[0] if urls else None
+    if not isinstance(obj, dict):
+        return None
+    for key in ("audio", "audio_url", "url", "record", "file", "voice", "mp3"):
+        val = obj.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+        if isinstance(val, dict):
+            u = pick_audio_url(val)
+            if u:
+                return u
+    data = obj.get("data")
+    if isinstance(data, dict):
+        return pick_audio_url(data)
+    if isinstance(data, str) and data.startswith("http"):
+        return data
+    return None
 
 
 async def fetch_history(uid: str) -> dict:
-    encoded = quote(uid, safe="")
-    urls = [
-        f"{config.HISTORY_API}?uid={encoded}",
-        f"{config.HISTORY_API}?uid={uid}",
-    ]
+    url = f"{config.HISTORY_API}?uid={uid}"
     timeout = aiohttp.ClientTimeout(total=30)
-    last = {"parsed": None, "body": "", "raw": b"", "ctype": "", "audio_url": None}
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for url in urls:
-            try:
-                async with session.get(url) as resp:
-                    raw = await resp.read()
-                    ctype = resp.headers.get("Content-Type", "")
-                    try:
-                        body = raw.decode("utf-8", "replace")
-                    except Exception:
-                        body = ""
-            except Exception as e:
-                log.warning("history fetch fail %s: %s", url, e)
-                continue
-            parsed = None
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                parsed = None
-            audio_url = pick_audio_url(parsed) if parsed else None
-            if not audio_url:
-                m = re.search(
-                    r"https?://[^\s\"\'<>]+\.(?:mp3|ogg|wav|m4a|aac)[^\s\"\'<>]*",
-                    body,
-                    re.I,
-                )
-                if m:
-                    audio_url = m.group(0)
-            last = {
-                "parsed": parsed,
-                "body": body,
-                "raw": raw,
-                "ctype": ctype,
-                "audio_url": audio_url,
-            }
-            if audio_url or (isinstance(parsed, dict) and parsed.get("success")):
-                return last
-            if isinstance(parsed, dict) and parsed.get("status") != "processing":
-                return last
-    return last
+        async with session.get(url) as resp:
+            body = await resp.text()
+            raw = await resp.read()
+            ctype = resp.headers.get("Content-Type", "")
+    parsed = None
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        parsed = None
+    audio_url = pick_audio_url(parsed) if parsed else None
+    if not audio_url:
+        m = re.search(
+            r"https?://[^\s\"'<>]+\.(?:mp3|ogg|wav|m4a|aac)[^\s\"'<>]*",
+            body,
+            re.I,
+        )
+        if m:
+            audio_url = m.group(0)
+    return {"parsed": parsed, "body": body, "raw": raw, "ctype": ctype, "audio_url": audio_url}
 
 
 async def send_audio_bytes(update: Update, raw: bytes, uid: str) -> bool:
@@ -586,27 +550,15 @@ async def receive_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("সঠিক UID দিন।")
         return WAIT_UID
 
-    wait = await update.message.reply_text("🔎 রেকর্ড খোঁজা হচ্ছে, অপেক্ষা করুন...")
-    hist = None
+    wait = await update.message.reply_text("🔎 রেকর্ড খোঁজা হচ্ছে...")
     try:
-        for i in range(8):
-            hist = await fetch_history(uid)
-            parsed = hist.get("parsed") or {}
-            if hist.get("audio_url"):
-                break
-            if isinstance(parsed, dict) and parsed.get("success") and parsed.get("status") != "processing":
-                break
-            if isinstance(parsed, dict) and parsed.get("status") == "processing":
-                await wait.edit_text(f"⏳ অডিও তৈরি হচ্ছে... ({i+1}/8)")
-                await asyncio.sleep(8)
-                continue
-            break
+        hist = await fetch_history(uid)
     except Exception as e:
         await wait.edit_text(f"❌ হিস্টরি API এরর: {e}")
         return ConversationHandler.END
 
-    parsed = (hist or {}).get("parsed") or {}
-    if isinstance(parsed, dict) and parsed.get("status") == "processing" and not (hist or {}).get("audio_url"):
+    parsed = hist.get("parsed") or {}
+    if isinstance(parsed, dict) and parsed.get("status") == "processing":
         await wait.edit_text(
             "⏳ কল এখনো চলছে বা অডিও তৈরি হয়নি।\n২–৩ মিনিট পর আবার একই UID পাঠান।",
             reply_markup=main_kb(),
@@ -774,3 +726,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

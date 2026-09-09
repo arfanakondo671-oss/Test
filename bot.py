@@ -124,19 +124,20 @@ def admin_kb() -> InlineKeyboardMarkup:
 
 
 JOIN_TEXT = (
-    "👋 <b>Welcome to Prank Call Bot!</b>\n\n"
-    "বট ব্যবহার করতে নিচের <b>সব চ্যানেলে</b> জয়েন থাকতে হবে।\n"
-    "কোনো একটা থেকে লিভ নিলে সেইটা আবার জয়েন করতে হবে।\n\n"
-    "জয়েন করে ✅ চাপুন।"
+    "👋 স্বাগতম!\n\n"
+    "সার্ভিস ব্যবহার করতে নিচের সব চ্যানেলে জয়েন থাকতে হবে।\n"
+    "কোনো চ্যানেল থেকে বের হয়ে গেলে সেই চ্যানেল আবার জয়েন করতে হবে।\n\n"
+    "জয়েন শেষ হলে ✅ বাটনে চাপুন।"
 )
 
 
 def home_html() -> str:
     return (
-        "👋 <b>Welcome to Prank Call Bot!</b>\n\n"
-        "নিচের মেনু থেকে সার্ভিস বেছে নিন।\n\n"
-        f"💵 প্রতি কল: <b>{config.CALL_COST} পয়েন্ট</b>\n"
-        f"🎁 BONUS ক্লিক করলে দৈনিক <b>{config.DAILY_BONUS}</b> পয়েন্ট"
+        "👋 স্বাগতম — <b>Prank Call</b>\n\n"
+        "নিচের মেনু থেকে অপশন বেছে নিন।\n\n"
+        f"• প্রতি কল: <b>{config.CALL_COST}</b> পয়েন্ট\n"
+        f"• ডেইলি বোনাস: <b>{config.DAILY_BONUS}</b> পয়েন্ট (BONUS)\n"
+        "• রেকর্ড শুনতে: CALL RECORD + UID"
     )
 
 
@@ -269,7 +270,7 @@ async def menu_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     await update.message.reply_text(
-        "🎭 <b>একটি প্র্যাঙ্ক টপিক নির্বাচন করুন:</b>",
+        "🎭 একটি প্র্যাঙ্ক টপিক বেছে নিন:",
         reply_markup=prank_kb(),
         parse_mode=ParseMode.HTML,
     )
@@ -410,9 +411,11 @@ async def send_prank_api(number: str, prank_id: str) -> dict:
                 if uid:
                     uid = str(uid).strip()
 
+    # Strict: real success needs API success + device uid
+    real_ok = bool(ok and uid)
     return {
-        "ok": ok or bool(uid),
-        "uid": uid,
+        "ok": real_ok,
+        "uid": uid if real_ok else None,
         "task_id": task_id,
         "raw": text,
         "json": parsed,
@@ -454,45 +457,72 @@ async def receive_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("আবার SEND CALL চাপুন।", reply_markup=main_kb())
         return ConversationHandler.END
 
-    wait = await update.message.reply_text("⏳ কল পাঠানো হচ্ছে...")
+    wait = await update.message.reply_text("⏳ কল পাঠানো হচ্ছে, একটু অপেক্ষা করুন...")
     try:
         result = await send_prank_api(number, prank_id)
     except Exception as e:
         log.exception("API error")
-        await wait.edit_text(f"❌ API এরর: {e}", reply_markup=main_kb())
+        await wait.edit_text(
+            "❌ কল পাঠাতে ব্যর্থ হয়েছে।\n\n"
+            "সমস্যার কারণ এক নাম্বারে বার বার কল করার কারণে নাম্বার টি সাময়িক ভাবে ব্লক হয়েছে। "
+            "অপেক্ষা করুন, ঠিক হয়ে যাবে — আপনি অন্য নাম্বারে চেষ্টা করুন!\n\n"
+            "✅ আপনার ব্যালেন্স কাটা হয়নি।",
+            reply_markup=main_kb(),
+        )
+        context.user_data.pop("prank_id", None)
         return ConversationHandler.END
 
     uid = result.get("uid")
     task_id = result.get("task_id")
     title = config.PRANK_MAP.get(prank_id, prank_id)
+    api_msg = (result.get("message") or "").lower()
+    raw_l = (result.get("raw") or "").lower()
 
-    if not uid:
-        snippet = (result.get("raw") or "")[:300]
-        api_msg = result.get("message") or ""
+    failed = not result.get("ok") or not uid
+    blocked_hint = any(
+        w in api_msg or w in raw_l
+        for w in (
+            "block",
+            "blocked",
+            "limit",
+            "spam",
+            "too many",
+            "wait",
+            "busy",
+            "fail",
+            "error",
+            "blacklist",
+            "banned",
+            "rate",
+        )
+    )
+
+    if failed:
+        # no coin cut
         await wait.edit_text(
-            "❌ কল গেছে কিন্তু UID পাওয়া যায়নি।\n"
-            f"API: {api_msg}\n"
-            f"<code>{snippet}</code>",
-            parse_mode=ParseMode.HTML,
+            "❌ কল পাঠাতে ব্যর্থ হয়েছে।\n\n"
+            "সমস্যার কারণ এক নাম্বারে বার বার কল করার কারণে নাম্বার টি সাময়িক ভাবে ব্লক হয়েছে। "
+            "অপেক্ষা করুন, ঠিক হয়ে যাবে — আপনি অন্য নাম্বারে চেষ্টা করুন!\n\n"
+            "✅ আপনার ব্যালেন্স কাটা হয়নি।",
             reply_markup=main_kb(),
         )
-        log.warning("no uid raw=%s", result.get("raw"))
+        log.info("call fail number=%s msg=%s raw=%s", number, result.get("message"), (result.get("raw") or "")[:200])
+        context.user_data.pop("prank_id", None)
         return ConversationHandler.END
 
+    # success only → cut balance
     add_points(user.id, -config.CALL_COST)
     save_call(user.id, number, prank_id, str(uid))
     left = (get_user(user.id) or {}).get("points", 0)
 
-    extra = f"\n🧾 Task: <code>{task_id}</code>" if task_id else ""
     await wait.edit_text(
-        "✅ <b>Prank Call Sent Successfully!</b>\n\n"
-        f"🎯 Target: <code>{number}</code>\n"
+        "✅ কল সফলভাবে পাঠানো হয়েছে!\n\n"
+        f"🎯 নাম্বার: <code>{number}</code>\n"
+        f"🎭 প্র্যাঙ্ক: {title}\n"
         f"🆔 Joke ID: <code>{prank_id}</code>\n"
-        f"📝 {title}\n"
-        f"🔑 Generated UID: <code>{uid}</code>"
-        f"{extra}\n\n"
-        "💡 রেকর্ড শুনতে নিচের <b>CALL RECORD</b> চাপুন, তারপর এই UID পেস্ট করুন।\n"
-        f"💰 অবশিষ্ট পয়েন্ট: <b>{left}</b>",
+        f"🔑 UID: <code>{uid}</code>\n\n"
+        "রেকর্ড শুনতে নিচের <b>CALL RECORD</b> চাপুন, তারপর এই UID পাঠান।\n"
+        f"💰 বর্তমান ব্যালেন্স: <b>{left}</b>",
         parse_mode=ParseMode.HTML,
     )
     context.user_data.pop("prank_id", None)
@@ -508,14 +538,14 @@ async def menu_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pts = u["points"] if u else 0
     if ok:
         await update.message.reply_text(
-            f"🎁 <b>বোনাস ক্লেইম হয়েছে!</b>\n\n+{config.DAILY_BONUS} পয়েন্ট\n"
-            f"💰 ব্যালেন্স: <b>{pts}</b>\n\nআজ আর ক্লেইম করা যাবে না।",
+            f"🎁 ডেইলি বোনাস যোগ হয়েছে!\n\n+{config.DAILY_BONUS} পয়েন্ট\n"
+            f"💰 বর্তমান ব্যালেন্স: <b>{pts}</b>\n\nআজকের বোনাস নেওয়া হয়ে গেছে। কাল আবার চেষ্টা করুন।",
             parse_mode=ParseMode.HTML,
             reply_markup=main_kb(),
         )
     else:
         await update.message.reply_text(
-            f"⚠️ আজকের বোনাস ইতিমধ্যে নিয়েছেন।\n💰 ব্যালেন্স: <b>{pts}</b>",
+            f"⚠️ আজকের বোনাস ইতিমধ্যে নেওয়া হয়েছে।\n💰 বর্তমান ব্যালেন্স: <b>{pts}</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=main_kb(),
         )
@@ -528,8 +558,9 @@ async def menu_refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{update.effective_user.id}"
     await update.message.reply_text(
-        "👥 <b>রেফার সিস্টেম</b>\n\n"
-        f"প্রতি সফল রেফারে <b>{config.REFERRAL_REWARD} পয়েন্ট</b>।\n\n"
+        "👥 রেফার করে পয়েন্ট নিন\n\n"
+        f"প্রতিটি সফল রেফারে পাবেন <b>{config.REFERRAL_REWARD} পয়েন্ট</b>।\n"
+        "নিচের লিংক শেয়ার করুন:\n\n"
         f"🔗 <code>{link}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=main_kb(),
@@ -543,8 +574,9 @@ async def menu_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = get_user(update.effective_user.id)
     pts = u["points"] if u else 0
     await update.message.reply_text(
-        "💰 <b>আপনার ব্যালেন্স</b>\n━━━━━━━━━━━━\n"
-        f"🆔 <code>{update.effective_user.id}</code>\n"
+        "💰 আপনার ব্যালেন্স\n"
+        "──────────────\n"
+        f"🆔 ID: <code>{update.effective_user.id}</code>\n"
         f"💎 পয়েন্ট: <b>{pts}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=main_kb(),
@@ -557,11 +589,8 @@ async def menu_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     context.user_data["awaiting_uid"] = True
     await update.message.reply_text(
-        "🎧 <b>CALL RECORD</b>\n\n"
-        "যেকোনো UID পাঠান (পুরনো হলেও চলবে)।\n"
-        "API থেকে অডিও এলে সরাসরি ভয়েস পাঠাবে।\n\n"
-        "যেমন: <code>0c1ee0f22f7fb4b4@jokesphone</code>\n\n"
-        "❌ /cancel",
+        "🎙️ অনুগ্রহ করে আপনার Prank UID-টি পাঠান:\n"
+        "(যেমন: <code>3e3f72e020e98299@jokesphone</code>)",
         parse_mode=ParseMode.HTML,
         reply_markup=main_kb(),
     )

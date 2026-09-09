@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from io import BytesIO
 from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
 from telegram import (
@@ -461,146 +463,247 @@ async def menu_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_record(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await gate(update, context):
         return ConversationHandler.END
+    context.user_data["awaiting_uid"] = True
     await update.message.reply_text(
-        "🎧 <b>CALL RECORD</b>\n\nকল পাঠানোর পর যে UID পেয়েছেন সেটা পাঠান।\n"
-        "যেমন: <code>97d91c87981bdc4b@jokesphone</code>\n\n❌ /cancel",
+        "🎧 <b>CALL RECORD</b>\n\n"
+        "যেকোনো UID পাঠান (পুরনো হলেও চলবে)।\n"
+        "API থেকে অডিও এলে সরাসরি ভয়েস পাঠাবে।\n\n"
+        "যেমন: <code>0c1ee0f22f7fb4b4@jokesphone</code>\n\n"
+        "❌ /cancel",
         parse_mode=ParseMode.HTML,
         reply_markup=main_kb(),
     )
     return WAIT_UID
 
 
-def pick_audio_url(obj) -> Optional[str]:
-    if not isinstance(obj, dict):
+
+def walk_urls(obj, found=None):
+    if found is None:
+        found = []
+    if isinstance(obj, dict):
+        for v in obj.values():
+            walk_urls(v, found)
+    elif isinstance(obj, list):
+        for v in obj:
+            walk_urls(v, found)
+    elif isinstance(obj, str):
+        if obj.startswith("http") or obj.startswith("//"):
+            found.append(obj if obj.startswith("http") else "https:" + obj)
+    return found
+
+
+def extract_audio_url(parsed) -> Optional[str]:
+    """Prefer explicit audio_url from history API."""
+    if not isinstance(parsed, dict):
         return None
-    for key in ("audio", "audio_url", "url", "record", "file", "voice", "mp3"):
-        val = obj.get(key)
+    for key in ("audio_url", "audio", "url", "record", "file", "voice", "mp3"):
+        val = parsed.get(key)
         if isinstance(val, str) and val.startswith("http"):
-            return val
-        if isinstance(val, dict):
-            u = pick_audio_url(val)
-            if u:
-                return u
-    data = obj.get("data")
+            return val.replace("\\/", "/")
+    data = parsed.get("data")
     if isinstance(data, dict):
-        return pick_audio_url(data)
-    if isinstance(data, str) and data.startswith("http"):
-        return data
+        for key in ("audio_url", "audio", "url", "record"):
+            val = data.get(key)
+            if isinstance(val, str) and val.startswith("http"):
+                return val.replace("\\/", "/")
+    # fallback: any http link that looks like media
+    for u in walk_urls(parsed):
+        u = u.replace("\\/", "/")
+        if re.search(r"\.(mp3|ogg|wav|m4a|aac|opus)(\?|$)", u, re.I):
+            return u
+        if any(x in u.lower() for x in ("audio", "record", "bromas", "jokesphone", "cdn")):
+            return u
     return None
 
 
 async def fetch_history(uid: str) -> dict:
-    url = f"{config.HISTORY_API}?uid={uid}"
-    timeout = aiohttp.ClientTimeout(total=30)
+    encoded = quote(uid, safe="")
+    candidates = [
+        f"{config.HISTORY_API}?uid={encoded}",
+        f"{config.HISTORY_API}?uid={uid}",
+    ]
+    timeout = aiohttp.ClientTimeout(total=25)
+    last = {"parsed": None, "body": "", "audio_url": None}
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            body = await resp.text()
-            raw = await resp.read()
-            ctype = resp.headers.get("Content-Type", "")
-    parsed = None
-    try:
-        parsed = json.loads(body)
-    except json.JSONDecodeError:
-        parsed = None
-    audio_url = pick_audio_url(parsed) if parsed else None
-    if not audio_url:
-        m = re.search(
-            r"https?://[^\s\"'<>]+\.(?:mp3|ogg|wav|m4a|aac)[^\s\"'<>]*",
-            body,
-            re.I,
-        )
-        if m:
-            audio_url = m.group(0)
-    return {"parsed": parsed, "body": body, "raw": raw, "ctype": ctype, "audio_url": audio_url}
+        for url in candidates:
+            try:
+                async with session.get(url) as resp:
+                    body = await resp.text()
+            except Exception as e:
+                log.warning("history fail %s: %s", url, e)
+                continue
+            parsed = None
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = None
+            audio_url = extract_audio_url(parsed) if parsed else None
+            if not audio_url:
+                m = re.search(
+                    r"https?://[^\s\"'<>]+\.(?:mp3|ogg|wav|m4a|aac)[^\s\"'<>]*",
+                    body.replace("\\/", "/"),
+                    re.I,
+                )
+                if m:
+                    audio_url = m.group(0)
+            last = {"parsed": parsed, "body": body, "audio_url": audio_url}
+            if audio_url:
+                return last
+            if isinstance(parsed, dict) and parsed.get("success") is True:
+                return last
+            if isinstance(parsed, dict) and parsed.get("status") == "processing":
+                return last
+    return last
 
 
-async def send_audio_bytes(update: Update, raw: bytes, uid: str) -> bool:
-    bio = BytesIO(raw)
-    bio.name = "record.ogg"
+async def send_audio_to_chat(update: Update, audio_url: str, uid: str) -> bool:
+    """Download then send as voice/audio; fallback to URL."""
+    caption = f"🔑 <code>{uid}</code>"
+    audio_bytes = None
     try:
-        await update.message.reply_voice(
-            voice=bio,
-            caption=f"🔑 <code>{uid}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return True
-    except TelegramError:
-        bio2 = BytesIO(raw)
-        bio2.name = "record.mp3"
+        timeout = aiohttp.ClientTimeout(total=45)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(audio_url) as resp:
+                if resp.status == 200:
+                    audio_bytes = await resp.read()
+    except Exception as e:
+        log.warning("download audio fail: %s", e)
+
+    if audio_bytes and len(audio_bytes) > 200:
+        bio = BytesIO(audio_bytes)
+        bio.name = "record.mp3"
         try:
             await update.message.reply_audio(
-                audio=bio2,
-                caption=f"🔑 <code>{uid}</code>",
+                audio=bio,
+                caption=caption,
                 parse_mode=ParseMode.HTML,
             )
             return True
-        except TelegramError:
-            return False
+        except TelegramError as e:
+            log.warning("reply_audio bytes fail: %s", e)
+            bio2 = BytesIO(audio_bytes)
+            bio2.name = "record.ogg"
+            try:
+                await update.message.reply_voice(
+                    voice=bio2,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
+            except TelegramError as e2:
+                log.warning("reply_voice bytes fail: %s", e2)
+
+    # Telegram can fetch http(s) URL for audio
+    try:
+        await update.message.reply_audio(
+            audio=audio_url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except TelegramError as e:
+        log.warning("reply_audio url fail: %s", e)
+    try:
+        await update.message.reply_voice(
+            voice=audio_url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except TelegramError as e:
+        log.warning("reply_voice url fail: %s", e)
+    try:
+        await update.message.reply_document(
+            document=audio_url,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+    except TelegramError as e:
+        log.warning("reply_document fail: %s", e)
+    return False
 
 
 async def receive_uid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if is_menu_text(text):
+        context.user_data.pop("awaiting_uid", None)
         return await route_menu(update, context)
     if not await gate(update, context):
         return ConversationHandler.END
 
-    uid = text
-    if len(uid) < 6:
+    uid = text.strip()
+    # strip accidental backticks or quotes
+    uid = uid.strip("`\"' ")
+    if len(uid) < 5:
         await update.message.reply_text("সঠিক UID দিন।")
         return WAIT_UID
 
-    wait = await update.message.reply_text("🔎 রেকর্ড খোঁজা হচ্ছে...")
+    wait = await update.message.reply_text("🔎 API চালু… রেকর্ড আনা হচ্ছে...")
     try:
         hist = await fetch_history(uid)
     except Exception as e:
-        await wait.edit_text(f"❌ হিস্টরি API এরর: {e}")
+        log.exception("history")
+        await wait.edit_text(f"❌ API এরর: {e}", reply_markup=main_kb())
+        context.user_data.pop("awaiting_uid", None)
         return ConversationHandler.END
 
     parsed = hist.get("parsed") or {}
-    if isinstance(parsed, dict) and parsed.get("status") == "processing":
-        await wait.edit_text(
-            "⏳ কল এখনো চলছে বা অডিও তৈরি হয়নি।\n২–৩ মিনিট পর আবার একই UID পাঠান।",
-            reply_markup=main_kb(),
-        )
-        return ConversationHandler.END
-
     audio_url = hist.get("audio_url")
-    raw = hist.get("raw") or b""
-    ctype = hist.get("ctype") or ""
 
     if audio_url:
-        try:
-            timeout = aiohttp.ClientTimeout(total=40)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(audio_url) as resp:
-                    audio_bytes = await resp.read()
-            if audio_bytes and len(audio_bytes) > 500:
-                if await send_audio_bytes(update, audio_bytes, uid):
-                    await wait.delete()
-                    return ConversationHandler.END
-            await update.message.reply_voice(
-                voice=audio_url,
-                caption=f"🔑 <code>{uid}</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            await wait.delete()
+        ok = await send_audio_to_chat(update, audio_url, uid)
+        if ok:
+            try:
+                await wait.delete()
+            except TelegramError:
+                pass
+            context.user_data.pop("awaiting_uid", None)
             return ConversationHandler.END
-        except Exception as e:
-            log.warning("audio fetch fail: %s", e)
+        await wait.edit_text(
+            f"⚠️ অডিও পাঠানো যায়নি।\n🔗 {audio_url}\n🔑 <code>{uid}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_kb(),
+        )
+        context.user_data.pop("awaiting_uid", None)
+        return ConversationHandler.END
 
-    if "audio" in ctype or raw[:3] == b"ID3" or raw[:4] in (b"OggS", b"RIFF"):
-        if await send_audio_bytes(update, raw, uid):
-            await wait.delete()
-            return ConversationHandler.END
+    if isinstance(parsed, dict) and parsed.get("status") == "processing":
+        await wait.edit_text(
+            "⏳ কল এখনো চলছে বা অডিও তৈরি হয়নি।\n"
+            "২–৩ মিনিট পর আবার একই UID পাঠান।",
+            reply_markup=main_kb(),
+        )
+        context.user_data.pop("awaiting_uid", None)
+        return ConversationHandler.END
 
+    msg = ""
+    if isinstance(parsed, dict):
+        msg = parsed.get("message") or parsed.get("status") or ""
     await wait.edit_text(
-        "⚠️ এখনো অডিও পাওয়া যায়নি। কিছুক্ষণ পর আবার চেষ্টা করুন।\n"
-        f"UID: <code>{uid}</code>",
+        "⚠️ এই UID-এ অডিও পাওয়া যায়নি।\n"
+        f"🔑 <code>{uid}</code>\n"
+        f"{msg}",
         parse_mode=ParseMode.HTML,
         reply_markup=main_kb(),
     )
+    context.user_data.pop("awaiting_uid", None)
     return ConversationHandler.END
+
+
+async def maybe_uid_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """If user is waiting for UID, or message looks like jokesphone uid, handle it."""
+    text = (update.message.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    if is_menu_text(text):
+        return
+    awaiting = context.user_data.get("awaiting_uid")
+    looks_uid = bool(re.search(r"@jokesphone", text, re.I)) or (
+        "@" in text and len(text) >= 10 and " " not in text
+    )
+    if awaiting or looks_uid:
+        return await receive_uid(update, context)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -719,6 +822,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("(?i)REFER"), menu_refer))
     app.add_handler(MessageHandler(filters.Regex("(?i)^(.{0,3})?BALANCE$"), menu_balance))
     app.add_handler(MessageHandler(filters.Regex("(?i)CALL RECORD"), menu_record))
+    # UID paste even if ConversationHandler state lost
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_uid_message))
 
     log.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -726,4 +831,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

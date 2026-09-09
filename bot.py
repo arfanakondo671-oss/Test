@@ -305,45 +305,120 @@ def normalize_number(raw: str) -> Optional[str]:
 
 
 def extract_uid(payload) -> Optional[str]:
+    """Pull device_id / uid from prank API JSON or raw text."""
+    if payload is None:
+        return None
+
+    def from_dict(d: dict) -> Optional[str]:
+        if not isinstance(d, dict):
+            return None
+        for key in (
+            "device_id",
+            "uid",
+            "UID",
+            "generated_uid",
+            "joke_uid",
+            "user_id",
+            "device",
+        ):
+            val = d.get(key)
+            if val is None:
+                continue
+            val = str(val).strip()
+            if val and val.lower() not in ("none", "null", "n/a"):
+                return val
+        for v in d.values():
+            if isinstance(v, str) and "@jokesphone" in v.lower():
+                return v.strip()
+            if isinstance(v, dict):
+                found = from_dict(v)
+                if found:
+                    return found
+        return None
+
     if isinstance(payload, dict):
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        found = from_dict(payload)
+        if found:
+            return found
+        data = payload.get("data")
         if isinstance(data, dict):
-            for key in ("device_id", "uid", "UID", "generated_uid", "joke_uid"):
-                val = data.get(key)
-                if val:
-                    return str(val)
-            for v in data.values():
-                if isinstance(v, str) and "@jokesphone" in v.lower():
-                    return v
-        raw = json.dumps(payload)
-        m = re.search(r"([0-9a-f]{8,32}@[A-Za-z0-9_.-]+)", raw, re.I)
+            found = from_dict(data)
+            if found:
+                return found
+        raw = json.dumps(payload, ensure_ascii=False)
+        m = re.search(r"([0-9a-fA-F]{6,64}@[A-Za-z0-9_.-]+)", raw)
         if m:
             return m.group(1)
+
     if isinstance(payload, str):
-        m = re.search(r"([0-9a-f]{8,32}@[A-Za-z0-9_.-]+)", payload, re.I)
+        text = payload
+        try:
+            parsed = json.loads(text)
+            found = extract_uid(parsed)
+            if found:
+                return found
+        except Exception:
+            pass
+        m = re.search(r"([0-9a-fA-F]{6,64}@[A-Za-z0-9_.-]+)", text)
+        if m:
+            return m.group(1)
+        m = re.search(r'"device_id"\s*:\s*"([^"]+)"', text)
+        if m:
+            return m.group(1)
+        m = re.search(r'"uid"\s*:\s*"([^"]+)"', text, re.I)
         if m:
             return m.group(1)
     return None
 
 
 async def send_prank_api(number: str, prank_id: str) -> dict:
-    url = f"{config.PRANK_API}?number={number}&prank={prank_id}"
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
+    timeout = aiohttp.ClientTimeout(total=50)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PrankBot/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    params = {"number": number, "prank": str(prank_id)}
+    text = ""
+    status = 0
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(config.PRANK_API, params=params) as resp:
+            status = resp.status
             text = await resp.text()
+
     parsed = None
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         parsed = None
+
     uid = extract_uid(parsed) or extract_uid(text)
     task_id = None
+    ok = False
+    msg = ""
     if isinstance(parsed, dict):
+        ok = bool(parsed.get("success"))
+        msg = str(parsed.get("message") or "")
         data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
         if isinstance(data, dict):
-            task_id = data.get("task_id")
-    return {"ok": True, "uid": uid, "task_id": task_id, "raw": text, "json": parsed}
+            task_id = data.get("task_id") or data.get("task")
+            if not uid:
+                uid = (
+                    data.get("device_id")
+                    or data.get("uid")
+                    or data.get("UID")
+                )
+                if uid:
+                    uid = str(uid).strip()
+
+    return {
+        "ok": ok or bool(uid),
+        "uid": uid,
+        "task_id": task_id,
+        "raw": text,
+        "json": parsed,
+        "status": status,
+        "message": msg,
+    }
 
 
 def is_menu_text(text: str) -> bool:
@@ -384,22 +459,39 @@ async def receive_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await send_prank_api(number, prank_id)
     except Exception as e:
         log.exception("API error")
-        await wait.edit_text(f"❌ API এরর: {e}")
+        await wait.edit_text(f"❌ API এরর: {e}", reply_markup=main_kb())
         return ConversationHandler.END
 
-    uid = result.get("uid") or "N/A"
+    uid = result.get("uid")
+    task_id = result.get("task_id")
+    title = config.PRANK_MAP.get(prank_id, prank_id)
+
+    if not uid:
+        snippet = (result.get("raw") or "")[:300]
+        api_msg = result.get("message") or ""
+        await wait.edit_text(
+            "❌ কল গেছে কিন্তু UID পাওয়া যায়নি।\n"
+            f"API: {api_msg}\n"
+            f"<code>{snippet}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_kb(),
+        )
+        log.warning("no uid raw=%s", result.get("raw"))
+        return ConversationHandler.END
+
     add_points(user.id, -config.CALL_COST)
     save_call(user.id, number, prank_id, str(uid))
     left = (get_user(user.id) or {}).get("points", 0)
-    title = config.PRANK_MAP.get(prank_id, prank_id)
 
+    extra = f"\n🧾 Task: <code>{task_id}</code>" if task_id else ""
     await wait.edit_text(
         "✅ <b>Prank Call Sent Successfully!</b>\n\n"
         f"🎯 Target: <code>{number}</code>\n"
         f"🆔 Joke ID: <code>{prank_id}</code>\n"
         f"📝 {title}\n"
-        f"🔑 Generated UID: <code>{uid}</code>\n\n"
-        "💡 রেকর্ড শুনতে নিচের CALL RECORD চাপুন, তারপর UID পেস্ট করুন।\n"
+        f"🔑 Generated UID: <code>{uid}</code>"
+        f"{extra}\n\n"
+        "💡 রেকর্ড শুনতে নিচের <b>CALL RECORD</b> চাপুন, তারপর এই UID পেস্ট করুন।\n"
         f"💰 অবশিষ্ট পয়েন্ট: <b>{left}</b>",
         parse_mode=ParseMode.HTML,
     )
